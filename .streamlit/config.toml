@@ -1,0 +1,19 @@
+[server]
+address = "127.0.0.1"
+port = 8504
+headless = true
+maxUploadSize = 1
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "none"
+
+[theme]
+base = "light"
+primaryColor = "#2563EB"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F1F5F9"
+textColor = "#111827"
