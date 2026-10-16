@@ -3,10 +3,11 @@
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, localcontext
 from io import BytesIO
-from typing import Sequence, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
+from pptx.chart.chart import Chart
 from pptx.dml.color import RGBColor
 from pptx.enum.chart import (XL_CHART_TYPE, XL_LABEL_POSITION,
                              XL_LEGEND_POSITION, XL_TICK_LABEL_POSITION, XL_TICK_MARK)
@@ -16,9 +17,11 @@ from pptx.opc.oxml import serialize_part_xml
 from pptx.oxml import parse_xml
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.presentation import Presentation as PresentationDocument
+from pptx.slide import Slide
 from pptx.util import Inches, Pt
 from xlsxwriter import Workbook
 
+import data as report_data
 from data import Metric, RATIO_NOTE, TABLE_HEADER, group_metrics, table_rows, validate_report
 
 
@@ -35,6 +38,25 @@ AXIS_TARGET_INTERVALS = 4
 AXIS_MIN_INTERVALS = 3
 AXIS_MIN_STEP = Decimal('0.01')
 AXIS_STEPS = (Decimal('1'), Decimal('2'), Decimal('5'), Decimal('10'))
+CHART_HEIGHT = Decimal('5.1')
+CHART_TOP = Decimal('1.15')
+CHART_GUTTER = Decimal('4.05')
+CONTENT_MARGINS = Decimal(1)
+AXIS_FONT_SIZE = Decimal(14)
+POINTS_PER_INCH = Decimal(72)
+AXIS_DIGIT_WIDTH = Decimal('0.56')
+AXIS_SIGN_WIDTH = Decimal('0.34')
+AXIS_SEPARATOR_WIDTH = Decimal('0.28')
+AXIS_MIN_MARGIN = Decimal('0.18')
+AXIS_TICK_MARGIN = Decimal('0.06')
+AXIS_VALUE_MARGIN = Decimal('0.12')
+AXIS_TOP_MARGIN = Decimal('0.03')
+AXIS_BOTTOM_MARGIN = Decimal('0.17')
+AXIS_LEGEND_MARGIN = Decimal('0.45')
+AXIS_LABEL_ROTATION = -2700000
+AXIS_NOTE_TOP = Decimal('6.34')
+AXIS_NOTE_HEIGHT = Decimal('0.27')
+CATEGORY_LINE_HEIGHT = 15
 
 
 class _SafeChartData(CategoryChartData):
@@ -121,14 +143,18 @@ def _table_slide(prs, page, period, number, index, count):
     _text(slide, RATIO_NOTE, .5, 6.34, CONTENT_WIDTH, .27)
 
 
-def _plot_layout(chart):
+def _plot_layout(chart: Chart, coordinates: Optional[Tuple[Decimal, Decimal, Decimal, Decimal]] = None) -> None:
     # Явная область построения выравнивает график с отдельными текстовыми подписями.
     plot_area = chart._chartSpace.chart.plotArea
     layout = OxmlElement('c:layout')
     manual = OxmlElement('c:manualLayout')
-    for tag, value in (('layoutTarget', 'inner'), ('xMode', 'factor'), ('yMode', 'factor'),
-                       ('wMode', 'factor'), ('hMode', 'factor'),
-                       ('x', '.08'), ('y', '.03'), ('w', '.86'), ('h', '.80')):
+    positions = (('x', '.08'), ('y', '.03'), ('w', '.86'), ('h', '.80'))
+    position_mode = 'factor'
+    if coordinates is not None:
+        positions = tuple((tag, str(value)) for tag, value in zip(('x', 'y', 'w', 'h'), coordinates))
+        position_mode = 'edge'
+    for tag, value in (('layoutTarget', 'inner'), ('xMode', position_mode), ('yMode', position_mode),
+                       ('wMode', 'factor'), ('hMode', 'factor')) + positions:
         element = OxmlElement('c:' + tag)
         element.set('val', value)
         manual.append(element)
@@ -181,19 +207,96 @@ def _configure_template(presentation: PresentationDocument) -> None:
         theme_part.blob = serialize_part_xml(theme)
 
 
-def _chart_slide(prs, unit, page, period, number, index, count):
+def _get_number_format(values: Sequence[Decimal]) -> str:
+    with localcontext() as context:
+        context.prec = 28
+        places = max(max(0, -value.normalize().as_tuple().exponent) for value in values)
+    return '0' if places == 0 else '0.' + '0' * places
+
+
+def _get_numeric_text_width(text: str) -> Decimal:
+    digits = sum(char.isdigit() for char in text)
+    signs = text.count('-')
+    separators = text.count('.')
+    width = digits * AXIS_DIGIT_WIDTH + signs * AXIS_SIGN_WIDTH + separators * AXIS_SEPARATOR_WIDTH
+    return width * AXIS_FONT_SIZE / POINTS_PER_INCH
+
+
+def _get_fixed_plot_layout(
+        minimum: Decimal, maximum: Decimal, step: Decimal) -> Tuple[Decimal, Decimal, Decimal, Decimal, int]:
+    with localcontext() as context:
+        context.prec = 28
+        chart_width = Decimal(WIDTH) / Inches(1) - CONTENT_MARGINS - CHART_GUTTER
+        number_format = _get_number_format((minimum, maximum, step))
+        places = len(number_format.partition('.')[2])
+        lower_text = format(minimum, f'.{places}f')
+        upper_text = format(maximum, f'.{places}f')
+        left = max(AXIS_MIN_MARGIN, _get_numeric_text_width(lower_text) / 2 + AXIS_TICK_MARGIN)
+        right = max(AXIS_MIN_MARGIN, _get_numeric_text_width(upper_text) / 2 + AXIS_TICK_MARGIN)
+        if minimum < 0:
+            left = max(left, _get_numeric_text_width(format(minimum, '.2f')) + AXIS_VALUE_MARGIN)
+        if maximum > 0:
+            right = max(right, _get_numeric_text_width(format(maximum, '.2f')) + AXIS_VALUE_MARGIN)
+        width = chart_width - left - right
+        intervals = int((maximum - minimum) / step)
+        tick_width = max(_get_numeric_text_width(format(minimum + index * step, f'.{places}f'))
+                         for index in range(intervals + 1))
+        rotation = AXIS_LABEL_ROTATION if tick_width + AXIS_VALUE_MARGIN > width / intervals else 0
+        bottom = CHART_HEIGHT * AXIS_BOTTOM_MARGIN
+        if rotation:
+            diagonal = Decimal(2).sqrt() / 2
+            label_height = (tick_width + AXIS_FONT_SIZE / POINTS_PER_INCH) * diagonal
+            bottom = max(bottom, AXIS_LEGEND_MARGIN + label_height)
+        height = CHART_HEIGHT * (1 - AXIS_TOP_MARGIN) - bottom
+        return left / chart_width, AXIS_TOP_MARGIN, width / chart_width, height / CHART_HEIGHT, rotation
+
+
+def _add_category_labels(
+        slide: Slide, page: Sequence[Metric],
+        layout: Optional[Tuple[Decimal, Decimal, Decimal, Decimal, int]]) -> None:
+    with localcontext() as context:
+        context.prec = 28
+        for row, metric in enumerate(page):
+            center = 1.15 + 5.1 * (.03 + .80 * (row + .5) / len(page))
+            height = 1.0
+            if layout is not None:
+                row_height = CHART_HEIGHT * layout[3] / len(page)
+                center = CHART_TOP + CHART_HEIGHT * layout[1] + row_height * (Decimal(row) + Decimal('0.5'))
+                height = min(Decimal(1), row_height)
+            frame = _text(slide, metric.name, .5, center - height / 2, 3.9, height)
+            frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+            if layout is not None:
+                for paragraph in frame.paragraphs:
+                    paragraph.line_spacing = Pt(CATEGORY_LINE_HEIGHT)
+
+
+def _configure_fixed_chart(
+        chart: Chart, bounds: Tuple[Decimal, Decimal], step: Decimal,
+        layout: Tuple[Decimal, Decimal, Decimal, Decimal, int]) -> None:
+    chart.value_axis.tick_labels.number_format = _get_number_format((bounds[0], bounds[1], step))
+    chart.value_axis.tick_label_position = XL_TICK_LABEL_POSITION.HIGH
+    properties = chart.value_axis._element.get_or_add_txPr()
+    properties.bodyPr.set('rot', str(layout[4]))
+    _plot_layout(chart, layout[:4])
+
+
+def _chart_slide(
+        prs: PresentationDocument, unit: str, page: Sequence[Metric], period: str,
+        number: int, index: int, count: int, axis_range: Optional[Tuple[Decimal, Decimal]] = None) -> None:
     slide = _new_slide(prs, f'План и факт · {unit} · график {index} из {count}', period, number)
     values = tuple(value for metric in page for value in (metric.plan, metric.actual))
     all_zero = all(value == 0 for value in values)
     number_format = '0' if all_zero else '0.00'
+    layout = None
+    if axis_range is not None:
+        number_format = _get_number_format(values)
+        step = report_data.calculate_fixed_axis_step(axis_range[0], axis_range[1])
+        layout = _get_fixed_plot_layout(axis_range[0], axis_range[1], step)
     chart_data = _SafeChartData(number_format=number_format)
     chart_data.categories = [metric.name for metric in page]
     chart_data.add_series('План', [float(metric.plan) for metric in page])
     chart_data.add_series('Факт', [float(metric.actual) for metric in page])
-    for row, metric in enumerate(page):
-        center = 1.15 + 5.1 * (.03 + .80 * (row + .5) / len(page))
-        frame = _text(slide, metric.name, .5, center - .5, 3.9, 1.0)
-        frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+    _add_category_labels(slide, page, layout)
     chart = slide.shapes.add_chart(XL_CHART_TYPE.BAR_CLUSTERED, Inches(4.55), Inches(1.15),
                                    Inches(CONTENT_WIDTH - 4.05), Inches(5.1), chart_data).chart
     _font(chart.font, 14)
@@ -230,14 +333,25 @@ def _chart_slide(prs, unit, page, period, number, index, count):
     axis.major_tick_mark = axis.minor_tick_mark = XL_TICK_MARK.NONE
     axis.tick_labels.number_format = number_format
     _font(axis.tick_labels.font, 14)
-    scale = _calculate_axis_scale(values)
+    if axis_range is None:
+        scale = _calculate_axis_scale(values)
+    else:
+        scale = (axis_range[0], axis_range[1], step)
     axis.minimum_scale = float(scale[0])
     axis.maximum_scale = float(scale[1])
     axis.major_unit = float(scale[2])
-    _plot_layout(chart)
+    if layout is None:
+        _plot_layout(chart)
+    else:
+        _configure_fixed_chart(chart, axis_range, step, layout)
+        note = (f'Шкала фиксирована: {report_data.format_number(axis_range[0])}…'
+                f'{report_data.format_number(axis_range[1])} {unit}')
+        _text(slide, note, .5, AXIS_NOTE_TOP, CONTENT_WIDTH, AXIS_NOTE_HEIGHT)
 
 
-def build_presentation(metrics: Sequence[Metric], title: str, period: str, comment: str) -> bytes:
+def build_presentation(
+        metrics: Sequence[Metric], title: str, period: str, comment: str,
+        axis_ranges: Optional[Mapping[str, Tuple[Decimal, Decimal]]] = None) -> bytes:
     """Build a widescreen presentation with editable tables and native charts
 
     Args:
@@ -245,12 +359,13 @@ def build_presentation(metrics: Sequence[Metric], title: str, period: str, comme
         title: Required report title
         period: Required reporting period
         comment: Optional title-slide paragraphs
+        axis_ranges: Optional fixed bounds for normalized current units
 
     Returns:
         Complete PPTX bytes
 
     Raises:
-        ValueError: If report fields or the metric count are invalid
+        ValueError: If report fields, metric count, fixed ranges or data bounds are invalid
     """
     fields = validate_report(title, period, comment)
     title = fields[0]
@@ -258,6 +373,7 @@ def build_presentation(metrics: Sequence[Metric], title: str, period: str, comme
     comment = fields[2]
     if not 1 <= len(metrics) <= 12:
         raise ValueError('Для презентации нужны от 1 до 12 показателей.')
+    report_data.validate_axis_ranges(metrics, axis_ranges)
     prs = Presentation()
     _configure_template(prs)
     timestamp = datetime.now(timezone.utc)
@@ -282,7 +398,8 @@ def build_presentation(metrics: Sequence[Metric], title: str, period: str, comme
     for index, page in enumerate(tables, 1):
         _table_slide(prs, page, period, len(prs.slides) + 1, index, len(tables))
     for index, (unit, page) in enumerate(charts, 1):
-        _chart_slide(prs, unit, page, period, len(prs.slides) + 1, index, len(charts))
+        bounds = axis_ranges.get(unit.casefold()) if axis_ranges else None
+        _chart_slide(prs, unit, page, period, len(prs.slides) + 1, index, len(charts), bounds)
     properties_part = prs.part.package.part_related_by(RELATIONSHIP_TYPE.EXTENDED_PROPERTIES)
     properties = parse_xml(properties_part.blob)
     properties.find(PROPERTIES_NAMESPACE + 'PresentationFormat').text = 'On-screen Show (16:9)'

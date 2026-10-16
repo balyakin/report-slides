@@ -2,10 +2,12 @@
 
 import csv
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP, localcontext
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, localcontext
 from io import StringIO
+import json
 import re
-from typing import Dict, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlencode
 
 
 CSV_HEADER = ('показатель', 'план', 'факт', 'единица')
@@ -20,6 +22,24 @@ REPORT_FIELDS: Dict[str, Tuple[str, int]] = {
     'period': ('Период', 60),
     'comment': ('Комментарий', 400),
 }
+AXIS_LIMIT = Decimal('1000000000')
+AXIS_RESOLUTION = Decimal('0.01')
+AXIS_TARGET_INTERVALS = Decimal(4)
+AXIS_MIN_INTERVALS = Decimal(2)
+AXIS_MAX_INTERVALS = Decimal(10)
+AXIS_NUMBER_LENGTH = 20
+AXIS_DECIMAL_PLACES = 2
+AXIS_STEPS = tuple(Decimal(multiplier) * Decimal(10) ** exponent
+                   for exponent in range(-2, 10) for multiplier in (1, 2, 5))
+AXIS_VERSION = 'report-slides-axis-v1'
+AXIS_QUERY_KEY = 'scales'
+AXIS_MAX_SETTINGS = 32
+AXIS_MAX_JSON_BYTES = 4096
+AXIS_MAX_URL_BYTES = 8192
+AXIS_PAYLOAD_SIZE = 2
+AXIS_RECORD_SIZE = 3
+AXIS_UNIT_LENGTH = 16
+AXIS_NUMBER = re.compile(r'[+-]?[0-9]+([.,][0-9]+)?\Z')
 
 
 @dataclass(frozen=True)
@@ -269,3 +289,280 @@ def validate_report(title: str, period: str, comment: str) -> Tuple[str, str, st
     """
     return (validate_report_field(title, 'title'), validate_report_field(period, 'period'),
             validate_report_field(comment, 'comment'))
+
+
+def _parse_axis_number(text: str, unit: str, field: str) -> Decimal:
+    value = text.strip()
+    prefix = f'Единица «{unit}», поле «{field}»: '
+    if not value:
+        raise ValueError(prefix + 'введите число.')
+    if len(value) > AXIS_NUMBER_LENGTH:
+        raise ValueError(prefix + 'допускается не больше 20 символов.')
+    if '%' in value:
+        raise ValueError(prefix + 'введите число без знака %.')
+    if any(char.isspace() for char in value):
+        raise ValueError(prefix + 'введите число без внутренних пробелов и переводов строк.')
+    if not AXIS_NUMBER.fullmatch(value):
+        raise ValueError(prefix + 'введите обычное десятичное число; экспонента, NaN и бесконечность запрещены.')
+    normalized = value.replace(',', '.')
+    fraction = normalized.partition('.')[2]
+    if len(fraction) > AXIS_DECIMAL_PLACES:
+        raise ValueError(prefix + 'допускается не больше двух дробных знаков; округления нет.')
+    number = Decimal(normalized)
+    if not -AXIS_LIMIT <= number <= AXIS_LIMIT:
+        raise ValueError(prefix + 'допустимы значения от −1000000000 до 1000000000.')
+    return number if number else Decimal(0)
+
+
+def _check_axis_bounds(minimum: Decimal, maximum: Decimal) -> None:
+    for number in (minimum, maximum):
+        if not number.is_finite():
+            raise ValueError('границы должны быть конечными числами.')
+        if not -AXIS_LIMIT <= number <= AXIS_LIMIT:
+            raise ValueError('допустимы значения от −1000000000 до 1000000000.')
+        if number.quantize(AXIS_RESOLUTION) != number:
+            raise ValueError('границы должны быть представимы с точностью до сотых без округления.')
+    if minimum >= maximum:
+        raise ValueError('минимум должен быть меньше максимума.')
+    if minimum > 0 or maximum < 0:
+        raise ValueError('диапазон должен включать ноль.')
+
+
+def _check_axis_intervals(minimum: Decimal, maximum: Decimal, step: Decimal) -> bool:
+    intervals = (maximum - minimum) / step
+    small = maximum - minimum == AXIS_RESOLUTION and step == AXIS_RESOLUTION
+    return AXIS_MIN_INTERVALS <= intervals <= AXIS_MAX_INTERVALS or small
+
+
+def calculate_fixed_axis_step(minimum: Decimal, maximum: Decimal) -> Decimal:
+    """Choose aligned fixed ticks without changing the requested bounds
+
+    Args:
+        minimum: Inclusive lower axis bound
+        maximum: Inclusive upper axis bound
+
+    Returns:
+        Decimal step shared by reports with these bounds
+
+    Raises:
+        ValueError: If bounds are invalid or no suitable ticks exist
+    """
+    with localcontext() as context:
+        context.prec = 28
+        _check_axis_bounds(minimum, maximum)
+        candidates = []
+        for step in AXIS_STEPS:
+            aligned = minimum % step == 0 and maximum % step == 0
+            if aligned and _check_axis_intervals(minimum, maximum, step):
+                intervals = (maximum - minimum) / step
+                candidates.append((abs(intervals - AXIS_TARGET_INTERVALS), -step, step))
+        if candidates:
+            return min(candidates)[2]
+        suggested = suggest_axis_range(minimum, maximum)
+        raise ValueError(
+            f'для диапазона {format_number(minimum)}…{format_number(maximum)} нет подходящих делений. '
+            f'Подойдёт диапазон {format_number(suggested[0])}…{format_number(suggested[1])}. Границы не изменены.'
+        )
+
+
+def suggest_axis_range(minimum: Decimal, maximum: Decimal) -> Tuple[Decimal, Decimal]:
+    """Suggest the smallest outward expansion with readable aligned ticks
+
+    Args:
+        minimum: Required lower bound, including all data
+        maximum: Required upper bound, including all data
+
+    Returns:
+        Suggested lower and upper bounds without applying them
+
+    Raises:
+        ValueError: If the requested bounds are invalid
+    """
+    with localcontext() as context:
+        context.prec = 28
+        _check_axis_bounds(minimum, maximum)
+        candidates = []
+        for step in AXIS_STEPS:
+            lower = (minimum / step).to_integral_value(rounding=ROUND_FLOOR) * step
+            upper = (maximum / step).to_integral_value(rounding=ROUND_CEILING) * step
+            inside = lower >= -AXIS_LIMIT and upper <= AXIS_LIMIT
+            if inside and _check_axis_intervals(lower, upper, step):
+                expansion = minimum - lower + upper - maximum
+                distance = abs((upper - lower) / step - AXIS_TARGET_INTERVALS)
+                candidates.append((expansion, distance, -step, lower, upper))
+        selected = min(candidates)
+        return selected[3], selected[4]
+
+
+def parse_axis_range(minimum_text: str, maximum_text: str, unit: str) -> Tuple[Decimal, Decimal]:
+    """Parse both fixed bounds with field-specific diagnostics
+
+    Args:
+        minimum_text: Original minimum input
+        maximum_text: Original maximum input
+        unit: Display unit used in validation messages
+
+    Returns:
+        Validated bounds as Decimals
+
+    Raises:
+        ValueError: If either field or the resulting range is invalid
+    """
+    minimum = _parse_axis_number(minimum_text, unit, 'Минимум')
+    maximum = _parse_axis_number(maximum_text, unit, 'Максимум')
+    try:
+        calculate_fixed_axis_step(minimum, maximum)
+    except ValueError as error:
+        raise ValueError(f'Единица «{unit}»: {error}') from error
+    return minimum, maximum
+
+
+def validate_axis_ranges(
+        metrics: Sequence[Metric], axis_ranges: Optional[Mapping[str, Tuple[Decimal, Decimal]]]) -> None:
+    """Validate fixed settings and report every out-of-range source value
+
+    Args:
+        metrics: Report metrics in CSV order
+        axis_ranges: Fixed ranges keyed by normalized current units
+
+    Returns:
+        None
+
+    Raises:
+        ValueError: If settings are invalid or source values exceed them
+    """
+    if not axis_ranges:
+        return
+    groups = group_metrics(metrics)
+    units = {unit.casefold() for unit, group in groups}
+    for key in axis_ranges:
+        if key not in units or key != key.casefold():
+            raise ValueError(f'Неизвестная или ненормализованная единица шкалы: «{key}».')
+    for unit, group in groups:
+        bounds = axis_ranges.get(unit.casefold())
+        if bounds is None:
+            continue
+        try:
+            if len(bounds) != AXIS_PAYLOAD_SIZE:
+                raise ValueError('нужны ровно две границы.')
+            calculate_fixed_axis_step(bounds[0], bounds[1])
+        except ValueError as error:
+            raise ValueError(f'Единица «{unit}»: {error}') from error
+    messages: List[str] = []
+    for metric in metrics:
+        bounds = axis_ranges.get(metric.unit.casefold())
+        if bounds is not None:
+            _collect_axis_violations(metric, bounds, messages)
+    if messages:
+        messages.extend(_get_axis_suggestions(groups, axis_ranges))
+        messages.append('Измените границы или выключите фиксированную шкалу.')
+        raise ValueError('\n'.join(messages))
+
+
+def _collect_axis_violations(metric: Metric, bounds: Tuple[Decimal, Decimal], messages: List[str]) -> None:
+    for field, value in (('План', metric.plan), ('Факт', metric.actual)):
+        if not bounds[0] <= value <= bounds[1]:
+            messages.append(
+                f'Показатель «{metric.name}», единица «{metric.unit}», {field}: {format_number(value)} '
+                f'вне диапазона {format_number(bounds[0])}…{format_number(bounds[1])}.'
+            )
+
+
+def _get_axis_suggestions(
+        groups: Sequence[Tuple[str, Sequence[Metric]]],
+        axis_ranges: Mapping[str, Tuple[Decimal, Decimal]]) -> List[str]:
+    messages = []
+    for unit, group in groups:
+        bounds = axis_ranges.get(unit.casefold())
+        if bounds is None:
+            continue
+        values = tuple(value for metric in group for value in (metric.plan, metric.actual))
+        minimum = min(bounds[0], *values)
+        maximum = max(bounds[1], *values)
+        if minimum != bounds[0] or maximum != bounds[1]:
+            suggested = suggest_axis_range(minimum, maximum)
+            messages.append(
+                f'Единица «{unit}»: подойдёт диапазон '
+                f'{format_number(suggested[0])}…{format_number(suggested[1])}. Границы не изменены.'
+            )
+    return messages
+
+
+def _check_axis_unit(unit: str) -> None:
+    _check_csv_text(unit, 'Единица шкалы')
+    if not unit or len(unit) > AXIS_UNIT_LENGTH or unit != unit.strip() or unit != unit.casefold():
+        raise ValueError('Единица шкалы должна быть непустой, нормализованной и не длиннее 16 символов.')
+
+
+def _check_axis_payload_size(payload: str) -> None:
+    try:
+        decoded_size = len(payload.encode('utf-8'))
+        encoded_size = len(urlencode({AXIS_QUERY_KEY: payload}).encode('ascii'))
+    except UnicodeError as error:
+        raise ValueError('Ссылка шкал содержит недопустимый Unicode.') from error
+    if decoded_size > AXIS_MAX_JSON_BYTES or encoded_size > AXIS_MAX_URL_BYTES:
+        raise ValueError('Ссылка шкал слишком длинная. Сбросьте шкалы и настройте нужные группы заново.')
+
+
+def serialize_axis_settings(settings: Mapping[str, Mapping[str, Any]]) -> str:
+    """Create the canonical URL payload from all enabled settings
+
+    Args:
+        settings: Session settings, including temporarily hidden units
+
+    Returns:
+        Compact JSON or an empty string when no fixed scales are enabled
+
+    Raises:
+        ValueError: If an enabled setting or the payload size is invalid
+    """
+    records = []
+    for unit in sorted(settings):
+        setting = settings[unit]
+        if setting['fixed']:
+            _check_axis_unit(unit)
+            bounds = parse_axis_range(setting['minimum'], setting['maximum'], unit)
+            records.append([unit, format_number(bounds[0]), format_number(bounds[1])])
+    if len(records) > AXIS_MAX_SETTINGS:
+        raise ValueError('В ссылке допускается не больше 32 шкал. Сбросьте шкалы и настройте нужные группы заново.')
+    if not records:
+        return ''
+    payload = json.dumps([AXIS_VERSION, records], ensure_ascii=False, separators=(',', ':'))
+    _check_axis_payload_size(payload)
+    return payload
+
+
+def parse_axis_settings(payload: str) -> Dict[str, Dict[str, Any]]:
+    """Restore a complete validated settings payload from an external URL
+
+    Args:
+        payload: Decoded scales query parameter
+
+    Returns:
+        Independent session settings for every saved unit
+
+    Raises:
+        ValueError: If the payload, structure, units or ranges are invalid
+    """
+    _check_axis_payload_size(payload)
+    try:
+        document = json.loads(payload)
+    except (ValueError, RecursionError) as error:
+        raise ValueError('Не удалось прочитать JSON шкал из ссылки.') from error
+    if type(document) is not list or len(document) != AXIS_PAYLOAD_SIZE or document[0] != AXIS_VERSION:
+        raise ValueError('Неподдерживаемый формат или версия ссылки шкал.')
+    records = document[1]
+    if type(records) is not list or len(records) > AXIS_MAX_SETTINGS:
+        raise ValueError('В ссылке должен быть список не более 32 шкал.')
+    settings: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        valid = type(record) is list and len(record) == AXIS_RECORD_SIZE
+        if not valid or any(type(value) is not str for value in record):
+            raise ValueError('Запись шкалы должна содержать три строки: единицу, минимум и максимум.')
+        unit = record[0]
+        _check_axis_unit(unit)
+        if unit in settings:
+            raise ValueError(f'Единица «{unit}»: шкала повторяется в ссылке.')
+        bounds = parse_axis_range(record[1], record[2], unit)
+        settings[unit] = {'fixed': True, 'minimum': format_number(bounds[0]), 'maximum': format_number(bounds[1])}
+    return settings

@@ -3,8 +3,9 @@ from io import BytesIO
 import logging
 import os
 from pathlib import Path
+import re
 import tempfile
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from playwright.sync_api import sync_playwright, expect
 from pptx import Presentation
@@ -35,6 +36,12 @@ with tempfile.TemporaryDirectory(prefix='report-slides-browser-') as temporary, 
     page.on('pageerror', lambda error: errors.append(str(error)))
     page.goto('http://127.0.0.1:8504')
     expect(page.get_by_role('heading', name='Report Slides', exact=True)).to_be_visible()
+    logo = page.locator('.st-key-brand_mark img')
+    expect(logo).to_be_visible()
+    assert logo.evaluate('(image) => image.complete && image.naturalWidth > 0')
+    expect(page.locator('[data-testid=stFileUploaderDropzoneInstructions]')).to_be_hidden()
+    expect(page.get_by_text('CSV UTF-8, до 256 КиБ', exact=True)).to_be_visible()
+    expect(page.get_by_role('button', name='Загрузить новый CSV', exact=True)).to_have_count(0)
     generate = page.get_by_role('button', name='Создать презентацию', exact=True)
     expect(generate).to_be_disabled()
     expect(page.get_by_text('Период: заполните поле.', exact=True)).to_have_count(0)
@@ -65,15 +72,15 @@ with tempfile.TemporaryDirectory(prefix='report-slides-browser-') as temporary, 
     result.save_as(downloads / 'first.pptx')
     first = (downloads / 'first.pptx').read_bytes()
     assert len(Presentation(BytesIO(first)).slides) == 5
-    page.get_by_text(', — запятая', exact=True).click()
-    expect(page.get_by_role('radio', name=', — запятая', exact=True)).to_be_checked()
+    page.get_by_text(', Запятая', exact=True).click()
+    expect(page.get_by_role('radio', name=', Запятая', exact=True)).to_be_checked()
     expect(pptx_button).to_have_count(0)
     expect(page.get_by_label('Период', exact=True)).to_have_value('5–11 октября 2026')
     expect(page.get_by_label('Комментарий на титуле (необязательно)', exact=True)).to_have_value(
         'Вымышленный пример для проверки.'
     )
-    page.get_by_text('; — точка с запятой', exact=True).click()
-    expect(page.get_by_role('radio', name='; — точка с запятой', exact=True)).to_be_checked()
+    page.get_by_text('; Точка с запятой', exact=True).click()
+    expect(page.get_by_role('radio', name='; Точка с запятой', exact=True)).to_be_checked()
     expect(generate).to_be_enabled()
     expect(pptx_button).to_have_count(0)
     generate.click()
@@ -116,7 +123,126 @@ with tempfile.TemporaryDirectory(prefix='report-slides-browser-') as temporary, 
     expect(page.get_by_role('heading', name='Report Slides', exact=True)).to_be_visible()
     expect(generate).to_be_disabled()
     expect(page.locator('[data-testid=stDataFrame]')).to_have_count(0)
+    page.goto('http://127.0.0.1:8504/?keep=yes')
+    upload.set_input_files({'name': 'week-1.csv', 'mimeType': 'text/csv', 'buffer': sample})
+    page.get_by_label('Период', exact=True).fill('Неделя 1')
+    page.get_by_label('Период', exact=True).press('Tab')
+    panel = page.locator('[data-testid=stExpander]')
+    if not panel.locator('[data-testid=stExpanderDetails]').is_visible():
+        page.get_by_text('Шкалы графиков', exact=True).click()
+    fixed = panel.get_by_role('checkbox', name='Фиксированная шкала', exact=True).first
+    fixed.focus()
+    fixed.press('Space')
+    expect(fixed).to_be_checked()
+    maximum = panel.get_by_label('Максимум', exact=True).first
+    expect(maximum).to_be_enabled()
+    maximum.fill('200')
+    maximum.press('Tab')
+    expect(generate).to_be_enabled()
+    save_scales = page.get_by_role('button', name='Сохранить шкалы в адресе', exact=True)
+    expect(save_scales).to_be_enabled()
+    save_scales.click()
+    expect(page).to_have_url(re.compile(r'.*[?&]scales='))
+    bookmark = page.url
+    generate.click()
+    with page.expect_download() as received:
+        pptx_button.click()
+    received.value.save_as(output / 'browser-fixed-week-1.pptx')
+    page.reload()
+    expect(page.locator('[data-testid=stDataFrame]')).to_have_count(0)
+    upload.set_input_files({'name': 'week-2.csv', 'mimeType': 'text/csv', 'buffer': sample.replace(b'120', b'121')})
+    page.get_by_label('Период', exact=True).fill('Неделя 2')
+    page.get_by_label('Период', exact=True).press('Tab')
+    if not panel.locator('[data-testid=stExpanderDetails]').is_visible():
+        page.get_by_text('Шкалы графиков', exact=True).click()
+    expect(fixed).to_be_checked()
+    expect(maximum).to_have_value('200')
+    generate.click()
+    with page.expect_download() as received:
+        pptx_button.click()
+    received.value.save_as(output / 'browser-fixed-week-2.pptx')
+    signatures = []
+    for filename in ('browser-fixed-week-1.pptx', 'browser-fixed-week-2.pptx'):
+        presentation = Presentation(str(output / filename))
+        signatures.append([(shape.chart.value_axis.minimum_scale, shape.chart.value_axis.maximum_scale,
+                            shape.chart.value_axis.major_unit)
+                           for slide in presentation.slides for shape in slide.shapes if shape.has_chart])
+    assert len({str(signature) for signature in signatures}) == 1
+    assert page.url == bookmark
+    page.get_by_role('button', name='Загрузить новый CSV', exact=True).click()
+    outliers = sample.replace(b'120', b'201').replace(b'135', b'230')
+    upload.set_input_files({'name': 'outliers.csv', 'mimeType': 'text/csv', 'buffer': outliers})
+    expect(page.get_by_text('План: 201', exact=False)).to_be_visible()
+    expect(page.get_by_text('Факт: 230', exact=False)).to_be_visible()
+    expect(maximum).to_be_visible()
+    expect(generate).to_be_disabled()
+    expect(pptx_button).to_have_count(0)
+    page.screenshot(path=str(output / 'browser-fixed-warning.png'), full_page=True)
+    maximum.fill('250')
+    maximum.press('Tab')
+    page.get_by_label('Период', exact=True).fill('Неделя 3')
+    page.get_by_label('Период', exact=True).press('Tab')
+    expect(generate).to_be_enabled()
+    generate.click()
+    expect(pptx_button).to_be_visible()
+    page.get_by_role('button', name='Загрузить новый CSV', exact=True).click()
+    literal = 'показатель;план;факт;единица\n``https://example.test/a``;201;230;**шт.**\n'.encode()
+    upload.set_input_files({'name': 'literal.csv', 'mimeType': 'text/csv', 'buffer': literal})
+    if not panel.locator('[data-testid=stExpanderDetails]').is_visible():
+        page.get_by_text('Шкалы графиков', exact=True).click()
+    fixed.focus()
+    fixed.press('Space')
+    expect(fixed).to_be_checked()
+    expect(maximum).to_be_enabled()
+    maximum.fill('200')
+    maximum.press('Tab')
+    expect(page.get_by_text('План: 201', exact=False)).to_be_visible()
+    expect(page.locator('[data-testid=stAlert] a')).to_have_count(0)
+    page.get_by_role('button', name='Загрузить новый CSV', exact=True).click()
+    literal_units = ('показатель;план;факт;единица\n'
+                     'Ссылки;1;2;[a](http://x.io)\nЖирный;1;2;**жирн**\n').encode()
+    upload.set_input_files({'name': 'literal-units.csv', 'mimeType': 'text/csv', 'buffer': literal_units})
+    expect(page.locator('[data-testid=stDataFrame]')).to_be_visible()
+    if not panel.locator('[data-testid=stExpanderDetails]').is_visible():
+        page.get_by_text('Шкалы графиков', exact=True).click()
+    expect(panel.get_by_text('[a](http://x.io)', exact=True)).to_be_visible()
+    expect(panel.get_by_text('**жирн**', exact=True)).to_be_visible()
+    expect(panel.locator('a, strong')).to_have_count(0)
+    page.get_by_role('button', name='Сбросить шкалы', exact=True).click()
+    expect(fixed).not_to_be_checked()
+    expect(page).to_have_url('http://127.0.0.1:8504/?keep=yes')
+    assert parse_qs(urlparse(page.url).query) == {'keep': ['yes']}
+    saved_scales = parse_qs(urlparse(bookmark).query)['scales']
+    for preserved in ({}, {'keep': ['yes', 'again']}):
+        query = dict(preserved, scales=saved_scales)
+        page.goto('http://127.0.0.1:8504/?' + urlencode(query, doseq=True))
+        upload.set_input_files({'name': 'bookmarked.csv', 'mimeType': 'text/csv', 'buffer': sample})
+        page.get_by_label('Период', exact=True).fill('Отчёт из закладки')
+        page.get_by_label('Период', exact=True).press('Tab')
+        if not panel.locator('[data-testid=stExpanderDetails]').is_visible():
+            page.get_by_text('Шкалы графиков', exact=True).click()
+        expect(fixed).to_be_checked()
+        expect(maximum).to_have_value('200')
+        generate.click()
+        expect(pptx_button).to_be_visible()
+        page.get_by_role('button', name='Сбросить шкалы', exact=True).click()
+        expected_url = 'http://127.0.0.1:8504/'
+        if preserved:
+            expected_url += '?' + urlencode(preserved, doseq=True)
+        expect(page).to_have_url(expected_url)
+        expect(fixed).not_to_be_checked()
+        expect(pptx_button).to_have_count(0)
+        expect(page.get_by_label('Период', exact=True)).to_have_value('Отчёт из закладки')
+        expect(page.locator('[data-testid=stDataFrame]')).to_be_visible()
+        page.reload()
+        expect(page.get_by_role('heading', name='Report Slides', exact=True)).to_be_visible()
+        upload.set_input_files({'name': 'after-reset.csv', 'mimeType': 'text/csv', 'buffer': sample})
+        if not panel.locator('[data-testid=stExpanderDetails]').is_visible():
+            page.get_by_text('Шкалы графиков', exact=True).click()
+        expect(fixed).not_to_be_checked()
+        expect(page).to_have_url(expected_url)
     assert not external, external
     assert not errors, errors
-    logger.info('Browser passed: downloads, CSV, PPTX, replacement, keyboard, refresh; screenshots: %s', output)
+    logger.info('Browser passed: CSV/PPTX, replacement, keyboard, bookmarks, fixed axes, outliers, literal text: %s',
+                output)
     browser.close()

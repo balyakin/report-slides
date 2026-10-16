@@ -8,7 +8,7 @@ from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 from pptx import Presentation
-from pptx.enum.chart import XL_CHART_TYPE
+from pptx.enum.chart import XL_CHART_TYPE, XL_TICK_LABEL_POSITION
 from pptx.util import Inches, Pt
 
 from data import Metric, parse_csv
@@ -293,6 +293,115 @@ class PresentationTests(unittest.TestCase):
         self.assertIsNotNone(tab_size, 'Default half-inch tabs can push the final word off the title slide')
         self.assertLessEqual(int(tab_size), Pt(16))
         self.assertEqual(paragraph.font.size, Pt(16))
+
+
+class FixedAxisTests(unittest.TestCase):
+    """Verify fixed ranges in actual native presentations"""
+
+    def test_same_ranges_preserve_geometry_across_weeks_and_pages(self) -> None:
+        """Use identical axes and plot geometry with changed values and category counts"""
+        # ARRANGE
+        first = (Metric('А', Decimal(100), Decimal(135), 'шт.'),
+                 Metric('Б', Decimal(0), Decimal(200), 'ШТ.'),
+                 Metric('В', Decimal(10), Decimal(20), 'шт.'),
+                 Metric('Г', Decimal(30), Decimal(40), 'шт.'),
+                 Metric('Д', Decimal(50), Decimal(60), 'шт.'))
+        second = (Metric('А', Decimal(100), Decimal(135), 'шт.'),
+                  Metric('Б', Decimal(20), Decimal(150), 'шт.'))
+        bounds = {'шт.': (Decimal(0), Decimal(200))}
+        signatures = []
+        # ACT
+        for source in (first, second):
+            blob = build_presentation(source, 'Отчёт', 'Неделя', '', axis_ranges=bounds)
+            presentation = Presentation(BytesIO(blob))
+            for slide in presentation.slides:
+                for shape in slide.shapes:
+                    if shape.has_chart:
+                        axis = shape.chart.value_axis
+                        manual = shape.chart._chartSpace.chart.plotArea.find('c:layout', NS)
+                        signatures.append((axis.minimum_scale, axis.maximum_scale, axis.major_unit,
+                                           axis.tick_labels.number_format, ET.tostring(manual)))
+        # ASSERT
+        self.assertEqual(len(signatures), 3)
+        self.assertEqual(len(set(signatures)), 1)
+        self.assertEqual(bounds, {'шт.': (Decimal(0), Decimal(200))})
+
+    def test_zero_fractional_and_mixed_unit_ranges(self) -> None:
+        """Keep fractional ticks and exact fractional data on an integer-scaled axis"""
+        # ARRANGE
+        source = (Metric('Нули', Decimal(0), Decimal(0), 'шт.'),
+                  Metric('Дробь', Decimal('120.25'), Decimal(135), 'руб.'),
+                  Metric('Авто', Decimal(1), Decimal(2), 'ч'))
+        ranges = {'шт.': (Decimal(0), Decimal('0.02')), 'руб.': (Decimal(0), Decimal(200))}
+        signatures = []
+        # ACT
+        blob = build_presentation(source, 'Отчёт', 'Неделя', '', ranges)
+        presentation = Presentation(BytesIO(blob))
+        for slide in presentation.slides:
+            for shape in slide.shapes:
+                if shape.has_chart:
+                    axis = shape.chart.value_axis
+                    signatures.append((axis.minimum_scale, axis.maximum_scale, axis.major_unit,
+                                       axis.tick_labels.number_format,
+                                       shape.chart.plots[0].data_labels.number_format))
+        # ASSERT
+        self.assertEqual(signatures, [(0.0, 0.02, 0.01, '0.00', '0'),
+                                      (0.0, 200.0, 50.0, '0', '0.00'),
+                                      (0.0, 3.0, 1.0, '0.00', '0.00')])
+        with ZipFile(BytesIO(blob)) as archive:
+            books = [workbook_cells(archive.read(name)) for name in archive.namelist() if name.endswith('.xlsx')]
+            self.assertTrue(any(Decimal('120.25') in book.values() for book in books))
+
+    def test_indicator_footer_labels_and_conditional_rotation(self) -> None:
+        """Keep the scale note out of the footer and category rectangles within their rows"""
+        # ARRANGE
+        cases = ((Decimal(200), Decimal(50), 0), (Decimal(900000000), Decimal(100000000), -2700000))
+        # ACT
+        for maximum, step, rotation in cases:
+            source = (Metric('А', Decimal(0), maximum, 'шт.'),
+                      Metric('Б', Decimal(0), maximum, 'шт.'),
+                      Metric('В', Decimal(0), maximum, 'шт.'),
+                      Metric('Г', Decimal(0), maximum, 'шт.'))
+            blob = build_presentation(source, 'Отчёт', 'Неделя', '', {'шт.': (Decimal(0), maximum)})
+            presentation = Presentation(BytesIO(blob))
+            # ASSERT
+            for slide in presentation.slides:
+                charts = [shape.chart for shape in slide.shapes if shape.has_chart]
+                if not charts:
+                    continue
+                notes = [shape for shape in slide.shapes if shape.has_text_frame
+                         and shape.text.startswith('Шкала фиксирована:')]
+                self.assertEqual([(shape.top, shape.height) for shape in notes], [(Inches(6.34), Inches(.27))])
+                for note in notes:
+                    self.assertLessEqual(note.top + note.height, Inches(6.64))
+                labels = [shape for shape in slide.shapes if shape.has_text_frame
+                          and shape.text in ('А', 'Б', 'В', 'Г')]
+                previous_bottom = 0
+                for label in labels:
+                    self.assertGreaterEqual(label.top, previous_bottom)
+                    self.assertEqual([paragraph.line_spacing for paragraph in label.text_frame.paragraphs], [Pt(15)])
+                    previous_bottom = label.top + label.height
+                for chart in charts:
+                    self.assertEqual(chart.value_axis.major_unit, float(step))
+                    self.assertEqual(chart.value_axis._element.txPr.bodyPr.get('rot'), str(rotation))
+                    self.assertEqual(chart.value_axis.tick_label_position, XL_TICK_LABEL_POSITION.HIGH)
+                    manual = chart._chartSpace.chart.plotArea.find('c:layout/c:manualLayout', NS)
+                    self.assertEqual([(tag, manual.find('c:' + tag, NS).get('val'))
+                                      for tag in ('xMode', 'yMode', 'wMode', 'hMode')],
+                                     [('xMode', 'edge'), ('yMode', 'edge'), ('wMode', 'factor'), ('hMode', 'factor')])
+
+    def test_direct_failures_precede_creation_and_keep_report_error_order(self) -> None:
+        """Validate metadata before ranges and reject clipped exports before constructing a package"""
+        # ARRANGE
+        source = (Metric('А', Decimal(201), Decimal(230), 'шт.'),)
+        # ACT
+        with patch('slides.Presentation') as constructor:
+            with self.assertRaisesRegex(ValueError, 'Название'):
+                build_presentation(source, '', 'Неделя', '', {'шт.': (Decimal(0), Decimal(117))})
+            with self.assertRaisesRegex(ValueError, 'План: 201.*\n.*Факт: 230'):
+                build_presentation(source, 'Отчёт', 'Неделя', '', {'шт.': (Decimal(0), Decimal(200))})
+            # ASSERT
+            constructor.assert_not_called()
 
 
 if __name__ == '__main__':

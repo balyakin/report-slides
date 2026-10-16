@@ -1,10 +1,13 @@
 import csv
 from decimal import Decimal, localcontext
 from io import StringIO
+import json
 from pathlib import Path
 import unittest
 
+import data as report_data
 from data import CSV_HEADER, group_metrics, parse_csv, table_rows, validate_report, validate_report_field
+
 
 
 HEADER = 'показатель;план;факт;единица\n'
@@ -297,6 +300,167 @@ class ReportFieldsTests(unittest.TestCase):
         ):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 validate_report(title, period, comment)
+
+
+class AxisRangeTests(unittest.TestCase):
+    """Exercise fixed bounds and untrusted bookmark payloads"""
+
+    def test_fixed_steps_and_outward_suggestions(self) -> None:
+        """Keep endpoints and zero on ticks while suggesting the closest safe expansion"""
+        # ARRANGE
+        cases = (('0', '200', '50'), ('-200', '0', '50'), ('-100', '100', '50'),
+                 ('0', '500', '100'), ('0', '250', '50'), ('0', '120', '20'),
+                 ('0', '0.02', '0.01'), ('-0.03', '0.02', '0.01'),
+                 ('0', '0.01', '0.01'), ('-0.01', '0', '0.01'), ('0', '0.3', '0.1'))
+        # ACT
+        for minimum, maximum, expected in cases:
+            result = report_data.calculate_fixed_axis_step(Decimal(minimum), Decimal(maximum))
+            # ASSERT
+            with self.subTest(minimum=minimum, maximum=maximum):
+                self.assertEqual(result, Decimal(expected))
+                self.assertEqual(Decimal(minimum) % result, 0)
+                self.assertEqual(Decimal(maximum) % result, 0)
+        self.assertEqual(report_data.suggest_axis_range(Decimal(0), Decimal('0.11')), (Decimal(0), Decimal('0.12')))
+        self.assertEqual(report_data.suggest_axis_range(Decimal(0), Decimal(117)), (Decimal(0), Decimal(120)))
+        self.assertEqual(report_data.suggest_axis_range(Decimal(0), Decimal(230)), (Decimal(0), Decimal(250)))
+
+    def test_range_parser_accepts_decimal_syntax_and_preserves_context(self) -> None:
+        """Parse comma and dot bounds without changing caller precision"""
+        # ARRANGE
+        cases = ((' -0 ', '+200', (Decimal(0), Decimal(200))),
+                 ('-200', '0', (Decimal(-200), Decimal(0))),
+                 ('-0,03', '0.02', (Decimal('-0.03'), Decimal('0.02'))))
+        # ACT
+        for minimum, maximum, expected in cases:
+            result = report_data.parse_axis_range(minimum, maximum, 'шт.')
+            # ASSERT
+            self.assertEqual(result, expected)
+        with localcontext() as context:
+            context.prec = 3
+            result = report_data.calculate_fixed_axis_step(Decimal('-1000000000'), Decimal('1000000000'))
+            self.assertEqual(result, Decimal('500000000'))
+            self.assertEqual(context.prec, 3)
+
+    def test_range_errors_follow_field_and_rule_order(self) -> None:
+        """Give UI diagnostics without Excel-specific advice or silent correction"""
+        # ARRANGE
+        cases = (('', 'NaN', 'Минимум.*введите число'),
+                 ('0', '', 'Максимум.*введите число'),
+                 ('0', '1' * 21, 'Максимум.*20 символов'),
+                 ('0', '1 %', 'Максимум.*без знака %'),
+                 ('0', '1\t0', 'Максимум.*без внутренних пробелов'),
+                 ('0', 'NaN', 'Максимум.*обычное десятичное число'),
+                 ('0', '1e3', 'Максимум.*экспонента'),
+                 ('0', '1.000', 'Максимум.*двух дробных'),
+                 ('0', '1000000000.01', 'Максимум.*от −1000000000'),
+                 ('0', '0', 'минимум должен быть меньше'),
+                 ('200', '100', 'минимум должен быть меньше'),
+                 ('10', '200', 'диапазон должен включать ноль'),
+                 ('-200', '-10', 'диапазон должен включать ноль'),
+                 ('0', '117', 'Подойдёт диапазон 0…120'))
+        # ACT
+        for minimum, maximum, expected in cases:
+            # ASSERT
+            with self.subTest(minimum=minimum, maximum=maximum):
+                with self.assertRaisesRegex(ValueError, 'Единица «шт.».*' + expected):
+                    report_data.parse_axis_range(minimum, maximum, 'шт.')
+
+    def test_direct_api_rejects_bad_bounds_and_unknown_keys(self) -> None:
+        """Reject nonfinite and imprecise bounds before exporting any chart"""
+        # ARRANGE
+        source = (report_data.Metric('Заявки', Decimal(0), Decimal(200), 'ШТ.'),)
+        cases = ((Decimal(0),), (Decimal(0), Decimal('NaN')), (Decimal('sNaN'), Decimal(200)),
+                 (Decimal(0), Decimal('Infinity')), (Decimal(0), Decimal('1e99999')),
+                 (Decimal('0.001'), Decimal(200)), (Decimal(0), Decimal(117)))
+        # ACT
+        for bounds in cases:
+            # ASSERT
+            with self.subTest(bounds=bounds), self.assertRaises(ValueError):
+                report_data.validate_axis_ranges(source, {'шт.': bounds})
+        for key in ('ШТ.', 'руб.'):
+            with self.assertRaisesRegex(ValueError, 'Неизвестная или ненормализованная'):
+                report_data.validate_axis_ranges(source, {key: (Decimal(0), Decimal(200))})
+        report_data.validate_axis_ranges(source, {'шт.': (Decimal('0.000'), Decimal('200.000'))})
+        report_data.validate_axis_ranges(source, None)
+        report_data.validate_axis_ranges(source, {})
+
+    def test_collects_all_outliers_and_keeps_other_units_automatic(self) -> None:
+        """Report plan then actual without confusing table calculations with chart values"""
+        # ARRANGE
+        source = (report_data.Metric('Заявки', Decimal(201), Decimal(230), 'шт.'),
+                  report_data.Metric('Границы', Decimal(0), Decimal(200), 'ШТ.'),
+                  report_data.Metric('Другая единица', Decimal(-1000), Decimal(1000), 'руб.'))
+        expected = (
+            'Показатель «Заявки», единица «шт.», План: 201 вне диапазона 0…200.\n'
+            'Показатель «Заявки», единица «шт.», Факт: 230 вне диапазона 0…200.\n'
+            'Единица «шт.»: подойдёт диапазон 0…250. Границы не изменены.\n'
+            'Измените границы или выключите фиксированную шкалу.'
+        )
+        # ACT
+        with self.assertRaises(ValueError) as caught:
+            report_data.validate_axis_ranges(source, {'шт.': (Decimal(0), Decimal(200))})
+        # ASSERT
+        self.assertEqual(str(caught.exception), expected)
+
+    def test_bookmarks_are_canonical_and_do_not_mutate_settings(self) -> None:
+        """Round-trip special units without floats, source files or raw formatting"""
+        # ARRANGE
+        settings = {'шт.': {'fixed': True, 'minimum': '-0', 'maximum': '200.00'},
+                    'ед:ч': {'fixed': True, 'minimum': '0', 'maximum': '0,02'},
+                    '%': {'fixed': True, 'minimum': '0', 'maximum': '100'},
+                    'a"b': {'fixed': True, 'minimum': '-200', 'maximum': '0'},
+                    'авто': {'fixed': False, 'minimum': 'NaN', 'maximum': ''}}
+        # ACT
+        payload = report_data.serialize_axis_settings(settings)
+        restored = report_data.parse_axis_settings(payload)
+        # ASSERT
+        self.assertEqual(restored, {
+            '%': {'fixed': True, 'minimum': '0', 'maximum': '100'},
+            'a"b': {'fixed': True, 'minimum': '-200', 'maximum': '0'},
+            'ед:ч': {'fixed': True, 'minimum': '0', 'maximum': '0,02'},
+            'шт.': {'fixed': True, 'minimum': '0', 'maximum': '200'},
+        })
+        self.assertEqual(report_data.serialize_axis_settings(restored), payload)
+        self.assertEqual(settings.get('шт.'), {'fixed': True, 'minimum': '-0', 'maximum': '200.00'})
+        disabled = {'авто': {'fixed': False, 'minimum': 'NaN', 'maximum': ''}}
+        self.assertEqual(report_data.serialize_axis_settings(disabled), '')
+
+    def test_untrusted_bookmark_structure_units_and_limits(self) -> None:
+        """Reject an entire malformed bookmark rather than restoring a partial configuration"""
+        # ARRANGE
+        invalid = ('', '{}', 'null', '[]', '["wrong",[]]', '["report-slides-axis-v1",{}]',
+                   '["report-slides-axis-v1",[["шт.",0,200]]]',
+                   '["report-slides-axis-v1",[["шт.","0"]]]',
+                   '["report-slides-axis-v1",[["ШТ.","0","200"]]]',
+                   '["report-slides-axis-v1",[[" шт.","0","200"]]]',
+                   '["report-slides-axis-v1",[["шт.","0","117"]]]',
+                   '["report-slides-axis-v1",[["шт.","0","200"],["шт.","0","100"]]]',
+                   '["report-slides-axis-v1",[["\\ud800","0","200"]]]',
+                   '[' * 1500 + ']' * 1500, '\ud800', ' ' * 4097)
+        # ACT
+        for payload in invalid:
+            # ASSERT
+            with self.subTest(payload=repr(payload)[:80]), self.assertRaises(ValueError):
+                report_data.parse_axis_settings(payload)
+
+    def test_bookmark_record_and_encoded_length_boundaries(self) -> None:
+        """Accept thirty-two settings and reject larger records or percent-encoded payloads"""
+        # ARRANGE
+        units = 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя'
+        records = [[unit, '0', '200'] for unit in units]
+        valid = json.dumps(['report-slides-axis-v1', records[:-1]])
+        excessive = json.dumps(['report-slides-axis-v1', records])
+        # ACT
+        restored = report_data.parse_axis_settings(valid)
+        # ASSERT
+        self.assertEqual(len(restored), 32)
+        with self.assertRaisesRegex(ValueError, '32 шкал'):
+            report_data.parse_axis_settings(excessive)
+        with self.assertRaisesRegex(ValueError, 'слишком длинная'):
+            report_data.parse_axis_settings('?' * 3000)
+        settings = {unit: {'fixed': True, 'minimum': '0', 'maximum': '200'} for unit in units}
+        with self.assertRaisesRegex(ValueError, '32 шкал'):
+            report_data.serialize_axis_settings(settings)
 
 
 if __name__ == '__main__':

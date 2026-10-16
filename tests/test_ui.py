@@ -7,6 +7,8 @@ from unittest.mock import patch
 from pptx import Presentation
 from streamlit.testing.v1 import AppTest
 
+import data as report_data
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = (ROOT / 'samples/weekly-report.csv').read_bytes()
@@ -120,7 +122,7 @@ class InterfaceTests(unittest.TestCase):
         self.assertTrue(app.button(key='generate').disabled)
         self.assertIsNone(app.session_state['metrics'])
         self.assert_no_export(app)
-        self.assertTrue(any('сессия' in message.value for message in app.info))
+        self.assertTrue(any('сессия' in message.value for message in app.caption))
         another = self.app()
         self.upload(app)
         self.assertIsNone(another.session_state['metrics'])
@@ -184,13 +186,13 @@ class InterfaceTests(unittest.TestCase):
         self.assert_no_export(app)
         self.assertEqual(app.text_input(key='period').value, '')
         app = self.generated()
-        app.radio(key='delimiter').set_value(',').run()
+        app.segmented_control(key='delimiter').set_value(',').run()
         self.assertFalse(app.exception)
         self.assertIsNone(app.session_state['metrics'])
         self.assert_no_export(app)
         self.assertEqual(app.text_area(key='comment').value, 'Комментарий')
         self.assertEqual(app.text_input(key='period').value, '5–11 октября 2026')
-        app.radio(key='delimiter').set_value(';').run()
+        app.segmented_control(key='delimiter').set_value(';').run()
         self.assertFalse(app.exception)
         self.assertEqual(len(app.session_state['metrics']), 4)
         self.assertEqual(app.text_area(key='comment').value, 'Комментарий')
@@ -273,6 +275,197 @@ class InterfaceTests(unittest.TestCase):
         self.upload(app, SAMPLE.replace(b'120', b'NaN'))
         self.assertIsNone(app.session_state['metrics'])
         self.assert_no_export(app)
+
+
+    def _set_fixed_axis(self, app: AppTest, unit: str = 'шт.', maximum: str = '200') -> AppTest:
+        app.checkbox(key='axis_fixed_' + unit).set_value(True).run()
+        app.text_input(key='axis_max_' + unit).set_value(maximum).run()
+        self.assertFalse(app.exception)
+        return app
+
+    def test_fixed_controls_validation_expansion_and_real_export(self) -> None:
+        """Open invalid controls and export the requested native range after correction"""
+        # ARRANGE
+        app = self.ready()
+        # ACT
+        app.checkbox(key='axis_fixed_шт.').set_value(True).run()
+        # ASSERT
+        self.assertTrue(app.button(key='generate').disabled)
+        self.assertTrue(app.button(key='axis_save').disabled)
+        self.assertTrue(any('Максимум' in message.value for message in app.error))
+        self.assertEqual(len(app.error), 1)
+        self.assertTrue(next(iter(app.expander)).proto.expanded)
+        app.text_input(key='axis_max_шт.').set_value('200').run()
+        self.assertFalse(app.error)
+        app.button(key='generate').click().run()
+        self.assertFalse(app.exception)
+        charts = [shape.chart for slide in Presentation(BytesIO(app.session_state['pptx'])).slides
+                  for shape in slide.shapes if shape.has_chart]
+        chart = next(chart for chart in charts
+                     if 'Заявки' in [category.label for category in chart.plots[0].categories])
+        self.assertEqual((chart.value_axis.minimum_scale, chart.value_axis.maximum_scale, chart.value_axis.major_unit),
+                         (0.0, 200.0, 50.0))
+
+    def test_axis_edits_and_returning_values_never_revive_an_old_export(self) -> None:
+        """Invalidate downloads before parsing changed bounds and ignore disabled invalid text"""
+        # ARRANGE
+        app = self._set_fixed_axis(self.ready())
+        app.button(key='generate').click().run()
+        # ACT
+        app.text_input(key='axis_max_шт.').set_value('NaN').run()
+        # ASSERT
+        self.assert_no_export(app)
+        self.assertTrue(app.button(key='generate').disabled)
+        app.checkbox(key='axis_fixed_шт.').set_value(False).run()
+        self.assertFalse(app.button(key='generate').disabled)
+        self.assertFalse(app.error)
+        app.button(key='generate').click().run()
+        app.checkbox(key='axis_fixed_шт.').set_value(True).run()
+        self.assert_no_export(app)
+        app.text_input(key='axis_max_шт.').set_value('200').run()
+        self.assertFalse(app.button(key='generate').disabled)
+        self.assert_no_export(app)
+
+    def test_all_outliers_block_generation_until_manual_correction(self) -> None:
+        """Keep every plan and actual violation visible without expanding the scale silently"""
+        # ARRANGE
+        app = self._set_fixed_axis(self.ready())
+        raw = 'показатель;план;факт;единица\nЗаявки;201;230;шт.\n'.encode()
+        # ACT
+        self.upload(app, raw)
+        app.text_input(key='period').set_value('Неделя 2').run()
+        # ASSERT
+        warnings = '\n'.join(message.value for message in app.warning)
+        self.assertIn('План: 201', warnings)
+        self.assertIn('Факт: 230', warnings)
+        self.assertIn('0…250', warnings)
+        self.assertTrue(app.button(key='generate').disabled)
+        self.assert_no_export(app)
+        self.assertEqual(app.text_input(key='axis_max_шт.').value, '200')
+        app.text_input(key='axis_max_шт.').set_value('250').run()
+        self.assertFalse(app.warning)
+        self.assertFalse(app.button(key='generate').disabled)
+        app.button(key='generate').click().run()
+        self.assertIsNotNone(app.session_state['pptx'])
+
+    def test_hidden_invalid_settings_survive_replacement_without_blocking_other_units(self) -> None:
+        """Restore raw settings after widget cleanup and preserve per-unit identity"""
+        # ARRANGE
+        app = self._set_fixed_axis(self.ready(), maximum='NaN')
+        rubles = 'показатель;план;факт;единица\nВыручка;1;2;руб.\n'.encode()
+        both = 'показатель;план;факт;единица\nВыручка;1;2;руб.\nЗаявки;120;135;ШТ.\n'.encode()
+        # ACT
+        self.upload(app, rubles)
+        app.text_input(key='period').set_value('Неделя').run()
+        # ASSERT
+        self.assertFalse(app.button(key='generate').disabled)
+        self.assertTrue(app.button(key='axis_save').disabled)
+        self.assertEqual(app.session_state['axis_settings'].get('шт.'),
+                         {'fixed': True, 'minimum': '0', 'maximum': 'NaN'})
+        app.button(key='generate').click().run()
+        self.upload(app, rubles.replace(b';1;', b';NaN;'))
+        self.assert_no_export(app)
+        self.upload(app, both)
+        self.assertTrue(app.checkbox(key='axis_fixed_шт.').value)
+        self.assertEqual(app.text_input(key='axis_max_шт.').value, 'NaN')
+        self.assertFalse(app.checkbox(key='axis_fixed_руб.').value)
+        self.assertTrue(app.button(key='generate').disabled)
+        app.segmented_control(key='delimiter').set_value(',').run()
+        app.segmented_control(key='delimiter').set_value(';').run()
+        self.assertEqual(app.text_input(key='axis_max_шт.').value, 'NaN')
+
+    def test_bookmark_restores_once_saves_explicitly_and_preserves_other_query_parameters(self) -> None:
+        """Restore a fresh session without carrying CSV or overwriting unsaved edits on reruns"""
+        # ARRANGE
+        payload = '["report-slides-axis-v1",[["шт.","0","200"]]]'
+        app = AppTest.from_file(str(ROOT / 'app.py'), default_timeout=15)
+        app.query_params = {'scales': payload, 'keep': ['yes', 'again']}
+        app.run()
+        # ACT
+        self.upload(app)
+        app.text_input(key='period').set_value('Неделя').run()
+        app.text_input(key='axis_max_шт.').set_value('250').run()
+        app.run()
+        # ASSERT
+        self.assertEqual(app.text_input(key='axis_max_шт.').value, '250')
+        self.assertEqual(app.query_params, {'scales': payload, 'keep': ['yes', 'again']})
+        self.assertTrue(any(message.value == 'Изменения шкал не сохранены в адресе' for message in app.caption))
+        app.button(key='axis_save').click().run()
+        saved = '["report-slides-axis-v1",[["шт.","0","250"]]]'
+        self.assertEqual(app.query_params, {'scales': saved, 'keep': ['yes', 'again']})
+        another = AppTest.from_file(str(ROOT / 'app.py'), default_timeout=15)
+        another.query_params = dict(app.query_params)
+        another.run()
+        self.assertIsNone(another.session_state['metrics'])
+        self.upload(another)
+        self.assertTrue(another.checkbox(key='axis_fixed_шт.').value)
+        self.assertEqual(another.text_input(key='axis_max_шт.').value, '250')
+        self.assertEqual(another.text_input(key='period').value, '')
+        another.button(key='axis_reset').click().run()
+        self.assertEqual(another.query_params, {'keep': ['yes', 'again']})
+        self.assertFalse(another.checkbox(key='axis_fixed_шт.').value)
+        self.assertIsNotNone(another.session_state['metrics'])
+        self.assertEqual(app.query_params, {'scales': saved, 'keep': ['yes', 'again']})
+
+    def test_canonical_bookmark_comparison_differs_from_raw_export_invalidation(self) -> None:
+        """Treat equivalent saved numbers equally while invalidating a changed PPTX input"""
+        # ARRANGE
+        app = self._set_fixed_axis(self.ready())
+        app.button(key='axis_save').click().run()
+        app.button(key='generate').click().run()
+        # ACT
+        app.text_input(key='axis_max_шт.').set_value('200,00').run()
+        # ASSERT
+        self.assert_no_export(app)
+        self.assertFalse(any(message.value == 'Изменения шкал не сохранены в адресе' for message in app.caption))
+        self.assertEqual(app.query_params, {'scales': '["report-slides-axis-v1",[["шт.","0","200"]]]'})
+        app.checkbox(key='axis_fixed_шт.').set_value(False).run()
+        app.button(key='axis_save').click().run()
+        self.assertEqual(app.query_params, {})
+
+    def test_malformed_bookmark_requires_explicit_reset(self) -> None:
+        """Reject repeated or malformed URL input atomically and keep reset available before CSV"""
+        # ARRANGE
+        payloads = ('', '{}', ['bad', 'also bad'])
+        # ACT
+        for payload in payloads:
+            app = AppTest.from_file(str(ROOT / 'app.py'), default_timeout=15)
+            app.query_params = {'scales': payload, 'keep': 'yes'}
+            app.run()
+            # ASSERT
+            self.assertFalse(app.exception)
+            self.assertTrue(app.error)
+            self.assertEqual(app.session_state['axis_settings'], {})
+            self.upload(app)
+            app.text_input(key='period').set_value('Неделя').run()
+            self.assertTrue(app.button(key='generate').disabled)
+            app.button(key='axis_reset').click().run()
+            self.assertFalse(app.error)
+            self.assertFalse(app.button(key='generate').disabled)
+            self.assertEqual(app.query_params, {'keep': 'yes'})
+            self.assertEqual(app.text_input(key='period').value, 'Неделя')
+
+    def test_fixed_settings_work_without_network_and_escape_warning_text(self) -> None:
+        """Preserve literal user text in warning Markdown and avoid external HTTP calls"""
+        # ARRANGE
+        raw = 'показатель;план;факт;единица\n``https://example.test/a``;201;230;**шт.**\n'.encode()
+        app = self.upload(self.app(), raw)
+        app.text_input(key='period').set_value('Неделя').run()
+        # ACT
+        with patch.object(socket.socket, 'connect', side_effect=AssertionError('External network')):
+            self._set_fixed_axis(app, '**шт.**')
+            app.button(key='axis_save').click().run()
+            warnings = [message.value for message in app.warning]
+            app.text_input(key='axis_max_**шт.**').set_value('250').run()
+            app.button(key='generate').click().run()
+            app.run()
+        # ASSERT
+        self.assertFalse(app.exception)
+        self.assertIsNotNone(app.session_state['pptx'])
+        self.assertTrue(any('``` Показатель «``https://example.test/a``», единица «**шт.**»' in message
+                            for message in warnings))
+        self.assertEqual(report_data.parse_axis_settings(app.query_params.get('scales')),
+                         {'**шт.**': {'fixed': True, 'minimum': '0', 'maximum': '200'}})
 
 
 if __name__ == '__main__':
